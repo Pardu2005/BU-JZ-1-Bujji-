@@ -13,13 +13,18 @@ Features:
   - Screenshot + Analyze      → say "screenshot" or "analyze screen"
   - Weather Info via OpenWeatherMap /data/2.5/weather (free — no card needed)
   - News Headlines via GNews API (free — 100 calls/day, no card needed)
-  - General AI Chat via Groq API (llama3-70b — free tier)
+  - General AI Chat via Groq API (openai/gpt-oss-120b)
 """
 
 import os
 import re
 import time
 import threading
+import sys
+import json
+import queue
+import atexit
+import subprocess
 import numpy as np
 import cv2
 import requests
@@ -39,12 +44,26 @@ import pyttsx3
 from groq import Groq
 
 # ──────────────────────────────────────────────
-# CONFIG — replace with your own keys
+# CONFIG — keys come from config_local.py (never committed) or .env / env vars
 # ──────────────────────────────────────────────
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")          # https://console.groq.com/
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")          # https://openweathermap.org/apiOPENWEATHER_KEY   = "c000e4c9ca09eb270b851afcab031300"   # https://openweathermap.org/api
-GNEWS_API_KEY     = "6e0fae9daab9cbe50d8e4bb8b7fba79f"         # https://gnews.io  (free, no card)
-GROQ_MODEL        = "llama-3.3-70b-versatile"                 # free Groq model
+from dotenv import load_dotenv
+
+load_dotenv()
+
+try:
+    import config_local as _cfg      # local file, never committed
+except ImportError:
+    _cfg = None
+
+
+def _key(name):
+    return getattr(_cfg, name, None) or os.getenv(name)
+
+
+GROQ_API_KEY        = _key("GROQ_API_KEY")
+OPENWEATHER_API_KEY = _key("OPENWEATHER_API_KEY")
+GNEWS_API_KEY       = _key("GNEWS_API_KEY")
+GROQ_MODEL          = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # OpenWeatherMap free-tier endpoint
 OWM_BASE_URL      = "http://api.openweathermap.org/data/2.5/weather"
@@ -69,17 +88,144 @@ WAKE_KEYWORDS     = ("bujji", "buddy", "buji")        # "buddy" as fallback if m
 # How long BUJJI stays active without a command before going back to sleep (seconds)
 SLEEP_TIMEOUT     = 120  # 2 minutes — enough for heavy tasks like BLIP/YOLO
 
+# ── Interrupt feature ─────────────────────────
+# Say any of these WHILE BUJJI is speaking to cut it off and ask something new.
+# Only short phrases (4 words or fewer) count, so BUJJI's own long sentences
+# bouncing back into the mic can't trigger it by accident.
+STOP_WORDS        = ("stop", "mute", "quiet", "silence", "enough", "shut up", "cancel", "pause")
+# Speech shorter than this many characters isn't interruptible (saves mic overhead)
+MIN_INTERRUPTIBLE_CHARS = 80
+# Quieter voice = less echo in the mic = your "stop" is easier to recognise (0.0–1.0)
+TTS_VOLUME        = 0.7
+# Language hint for recognising your "stop" (helps with Indian English)
+STT_LANGUAGE      = "en-IN"
+
 # ──────────────────────────────────────────────
 # INIT
 # ──────────────────────────────────────────────
 recognizer  = sr.Recognizer()
-tts_engine  = pyttsx3.init()
+
+# ── Speech runs in a SEPARATE PROCESS so it can be killed instantly ──
+# (pyttsx3's own stop() is unreliable on Windows; killing the process never fails.)
+_TTS_WORKER_SRC = r'''
+import sys, json
+import pyttsx3
+e = pyttsx3.init()
+try:
+    v = e.getProperty("voices")
+    if len(v) > 1:
+        e.setProperty("voice", v[1].id)
+    e.setProperty("volume", __VOL__)
+except Exception:
+    pass
+print("READY", flush=True)
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        e.say(json.loads(line))
+        e.runAndWait()
+    except Exception as ex:
+        print("ERR " + str(ex), flush=True)
+    print("DONE", flush=True)
+'''
+
+
+class _TTSWorker:
+    def __init__(self):
+        self.proc = None
+        self.q = None
+        self._start()
+
+    def _start(self):
+        src = _TTS_WORKER_SRC.replace("__VOL__", str(TTS_VOLUME))
+        self.proc = subprocess.Popen(
+            [sys.executable, "-u", "-c", src],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", bufsize=1,
+        )
+        q, proc = queue.Queue(), self.proc
+        self.q = q
+
+        def _reader():
+            try:
+                for line in proc.stdout:
+                    q.put(line.strip())
+            except Exception:
+                pass
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+    def _restart(self):
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+        self._start()
+
+    def kill(self):
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+
+    def say(self, text: str, interrupt: threading.Event) -> bool:
+        """Speak text. Returns True if finished, False if interrupted/failed."""
+        if self.proc.poll() is not None:
+            self._start()
+        for attempt in range(2):
+            try:
+                self.proc.stdin.write(json.dumps(text) + "\n")
+                self.proc.stdin.flush()
+                break
+            except Exception:
+                self._restart()
+                if attempt == 1:
+                    return False
+
+        deadline = time.time() + 30 + len(text) * 0.2
+        while True:
+            if interrupt.is_set():
+                self._restart()          # kill mid-sentence, fresh worker ready for next time
+                return False
+            try:
+                line = self.q.get(timeout=0.05)
+            except queue.Empty:
+                if self.proc.poll() is not None or time.time() > deadline:
+                    self._restart()
+                    return False
+                continue
+            if line == "DONE":
+                return True
+
+
+tts_worker = _TTSWorker()
+atexit.register(tts_worker.kill)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # Shared state for wake system
 _bujji_active  = threading.Event()   # set = BUJJI is awake and listening
 _bujji_running = threading.Event()   # set = entire program is running
 _bujji_running.set()
+_stop_speaking = threading.Event()   # set = user said "stop" / pressed a key — cut speech off
+_speaking      = threading.Event()   # set while BUJJI is speaking an interruptible answer
+
+# Global key listener: works even when the terminal isn't the focused window.
+# (needs:  pip install pynput)
+try:
+    from pynput import keyboard as _kb
+
+    def _on_global_key(key):
+        if _speaking.is_set():
+            print("[Interrupt] key pressed (global)")
+            _stop_speaking.set()
+
+    _global_key_listener = _kb.Listener(on_press=_on_global_key)
+    _global_key_listener.daemon = True
+    _global_key_listener.start()
+except Exception:
+    print("[Interrupt] pynput not available — only terminal keys will work (pip install pynput)")
 
 
 # ──────────────────────────────────────────────
@@ -103,8 +249,10 @@ def _listen_for_wake_phrase() -> bool:
                 phrase_time_limit=WAKE_PHRASE_WINDOW,
             )
         phrase = recognizer.recognize_google(audio).lower()
+        print(f"[Wake] heard: {phrase}")
         return any(kw in phrase for kw in WAKE_KEYWORDS)
-    except Exception:
+    except Exception as e:
+        print(f"[Wake] failed: {type(e).__name__}: {e}")
         return False
 
 
@@ -152,6 +300,10 @@ def wake_monitor():
                 samples = np.frombuffer(data, dtype=np.int16)
                 peak    = int(np.abs(samples).max())
 
+                # DEBUG: shows any noticeable sound so you can tune CLAP_THRESHOLD
+                if peak > 100:
+                    print(f"[Clap] peak={peak}")
+
                 if peak > CLAP_THRESHOLD:
                     # Clap detected — pause stream, check for wake phrase
                     stream.stop_stream()
@@ -159,8 +311,8 @@ def wake_monitor():
                         _bujji_active.set()
                     # Don't restart here — loop top handles it based on state
 
-            except Exception:
-                pass   # overflow / device hiccup — skip this chunk
+            except Exception as e:
+                print(f"[Mic] {type(e).__name__}: {e}")   # overflow / device hiccup
 
     finally:
         if stream is not None:
@@ -188,21 +340,122 @@ def clean_for_speech(text: str) -> str:
 # ──────────────────────────────────────────────
 # TTS: Speak response
 # ──────────────────────────────────────────────
-def speak(text: str):
+def _stop_listener(done: threading.Event, spoken: str):
+    """
+    Runs in a background thread WHILE BUJJI is speaking.
+    Listens in short bursts; if it hears a stop word, sets _stop_speaking.
+
+    The mic also picks up BUJJI's own voice, so a heard chunk is usually
+    "bujji's words + your word" and is longer than 4 words. So:
+      - a stop word that BUJJI is NOT saying itself counts at any length
+      - a stop word that IS in BUJJI's own text only counts in a short phrase
+    """
+    rec = sr.Recognizer()
+    rec.dynamic_energy_threshold = False   # don't let BUJJI's own voice raise the bar
+    rec.energy_threshold = 300
+    rec.pause_threshold = 0.5              # end a chunk quickly so "stop" isn't buried
+    spoken = spoken.lower()
+    print("[Interrupt] listening for a stop word...")
     try:
-        voices = tts_engine.getProperty('voices')
-        if len(voices) > 1:
-            tts_engine.setProperty('voice', voices[1].id)   # female voice
-        tts_engine.say(clean_for_speech(text))
-        tts_engine.runAndWait()
+        with sr.Microphone() as source:
+            while not done.is_set():
+                try:
+                    audio = rec.listen(source, timeout=1, phrase_time_limit=3)
+                except sr.WaitTimeoutError:
+                    continue
+                if done.is_set():
+                    break
+                try:
+                    heard = rec.recognize_google(audio, language=STT_LANGUAGE).lower()
+                except sr.UnknownValueError:
+                    print("[Interrupt] heard something, couldn't understand")
+                    continue
+                except sr.RequestError as e:
+                    print(f"[Interrupt] recognition error: {e}")
+                    continue
+                print(f"[Interrupt] heard: {heard}")
+                n_words = len(heard.split())
+                for w in STOP_WORDS:
+                    if re.search(r"\b" + re.escape(w), heard):
+                        own_word = re.search(r"\b" + re.escape(w), spoken) is not None
+                        if (not own_word) or n_words <= 4:
+                            _stop_speaking.set()
+                            break
+                if _stop_speaking.is_set():
+                    break
+    except Exception as e:
+        print(f"[Interrupt] listener error: {type(e).__name__}: {e}")
+
+
+def _key_listener(done: threading.Event):
+    """
+    Reliable backup: press ANY key in the terminal while BUJJI is speaking
+    (Enter / Space / Esc) and it stops instantly — no voice recognition needed.
+    """
+    try:
+        import msvcrt          # Windows only
+    except ImportError:
+        return
+    try:
+        while msvcrt.kbhit():  # throw away keys typed earlier
+            msvcrt.getwch()
+        while not done.is_set():
+            if msvcrt.kbhit():
+                msvcrt.getwch()
+                print("[Interrupt] key pressed")
+                _stop_speaking.set()
+                return
+            time.sleep(0.05)
+    except Exception as e:
+        print(f"[Interrupt] key listener error: {type(e).__name__}: {e}")
+
+
+def speak(text: str):
+    # If the user already said "stop", skip all remaining speech until the
+    # next time we listen (get_audio clears the flag).
+    if _stop_speaking.is_set():
+        return
+
+    done     = threading.Event()
+    listener = None
+    keythr   = None
+    try:
+        clean = clean_for_speech(text)
+        if not clean:
+            return
+
+        # Only long answers are worth watching for "stop"
+        if len(clean) > MIN_INTERRUPTIBLE_CHARS:
+            _speaking.set()
+            listener = threading.Thread(target=_stop_listener, args=(done, clean), daemon=True)
+            listener.start()
+            keythr = threading.Thread(target=_key_listener, args=(done,), daemon=True)
+            keythr.start()
+
+        tts_worker.say(clean, _stop_speaking)
     except Exception as e:
         print(f"[TTS Error] {e}")
+    finally:
+        _speaking.clear()
+        done.set()
+        if keythr is not None:
+            keythr.join(timeout=1)
+        if listener is not None:
+            listener.join(timeout=4)   # free the mic before get_audio() opens it
+        if _stop_speaking.is_set():
+            print("\n⏹  [BUJJI] Speech interrupted — ready for your next question.")
+            try:
+                import winsound
+                winsound.Beep(900, 150)   # short "I'm listening" beep (Windows)
+            except Exception:
+                pass
 
 
 # ──────────────────────────────────────────────
 # STT: Listen and transcribe
 # ──────────────────────────────────────────────
 def get_audio(timeout: int = 7, phrase_limit: int = 12) -> str | None:
+    _stop_speaking.clear()   # new listening turn — speech is allowed again
     with sr.Microphone() as source:
         print("\n🎙  Listening...")
         recognizer.adjust_for_ambient_noise(source, duration=0.8)
@@ -460,7 +713,7 @@ def get_weather(city: str) -> str:
     """
     params = {
         "q":      city,
-        "appid":  OPENWEATHER_KEY,
+        "appid":  OPENWEATHER_API_KEY,
         "units":  "metric",
     }
 
@@ -638,7 +891,8 @@ def chat_with_groq(prompt: str) -> str:
                 },
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=300,
+            max_tokens=1000,
+            reasoning_effort="low",
             temperature=0.7,
         )
         return completion.choices[0].message.content.strip()
@@ -884,4 +1138,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 

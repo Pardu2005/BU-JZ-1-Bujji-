@@ -1,5 +1,8 @@
+config_local.py
 .env
-*.env
-venv/
+*.jpg
+*.png
+.idea/
 __pycache__/
-*.pyc
+venv/
+.venv/
